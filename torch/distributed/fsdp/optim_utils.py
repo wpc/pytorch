@@ -59,6 +59,18 @@ class _PosDimTensorInfo(NamedTuple):
     dtype: torch.dtype
 
 
+class _BroadcastHandle(NamedTuple):
+    """
+    Used internally for :meth:`_broadcast_pos_dim_tensor_states`.
+
+    Attributes:
+        work (Work): Broadcast work handle with destination tensor ``tensor``.
+        tensor (torch.Tensor): Destination tensor.
+    """
+    work: Any
+    tensor: torch.Tensor
+
+
 def _unflatten_optim_state(
     fsdp_module,
     flat_param: FlatParameter,
@@ -738,7 +750,9 @@ def _broadcast_pos_dim_tensor_states(
         "Expects rank 0 to pass in the flattened optimizer state dict"
     no_tensor_osd = processed_optim_state_dict  # alias
     flat_osd = flat_optim_state_dict  # alias
-    for param_id, param_state in no_tensor_osd["state"].items():
+    # Sort the state entries to ensure that we wait on the broadcast handles in
+    # the same order that they are scheduled
+    for param_id, param_state in sorted(no_tensor_osd["state"].items()):
         for state_name, value in param_state.items():
             is_pos_dim_tensor_state = isinstance(value, _PosDimTensorInfo)
             if not is_pos_dim_tensor_state:
@@ -759,6 +773,14 @@ def _broadcast_pos_dim_tensor_states(
                     unsharded_tensor, param_state, state_name, shape, dtype,
                     broadcast_device, rank, group,
                 )  # modify `param_state` destructively
+    # Wait on the broadcast handles and move the tensor to the correct device
+    for _, param_state in sorted(no_tensor_osd["state"].items()):
+        for state_name, value in param_state.items():
+            if not isinstance(value, _BroadcastHandle):
+                continue
+            work, tensor = value.work, value.tensor
+            work.wait()
+            param_state[state_name] = tensor
     return no_tensor_osd
 
 
@@ -776,7 +798,9 @@ def _broadcast_sharded_pos_dim_tensor_state(
     """
     Broadcasts positive-dimension tensor state for the state ``state_name``
     corresponding to an FSDP parameter shard-by-shard, only to be saved on the
-    relevant rank. This modifies ``param_state`` destructively.
+    relevant rank. This modifies ``param_state`` destructively, replacing the
+    ``_PosDimTensorInfo`` metadata with a ``_BroadcastHandle`` object, which
+    contains the work handle to wait on.
 
     Args:
         unsharded_tensor (Optional[torch.Tensor]): Unsharded tensor from which
@@ -801,11 +825,13 @@ def _broadcast_sharded_pos_dim_tensor_state(
                 shape, requires_grad=False, dtype=dtype,
                 device=broadcast_device,
             )
-        dist.broadcast(sharded_tensor, src=0, group=group)
+        # Broadcast asynchronously and wait on the work handle later after all
+        # broadcasts have been scheduled
+        work = dist.broadcast(sharded_tensor, src=0, group=group, async_op=True)
         # Only keep the shard on the target rank and keep it on the broadcast
         # device, which is typically GPU
         if rank == target_rank:
-            param_state[state_name] = sharded_tensor
+            param_state[state_name] = _BroadcastHandle(work, sharded_tensor)
         else:
             del sharded_tensor
     # Lastly, shard on rank 0
@@ -827,7 +853,9 @@ def _broadcast_unsharded_pos_dim_tensor_state(
     """
     Broadcasts positive-dimension tensor state for the state ``state_name``
     corresponding to an unsharded non-FSDP parameter from rank 0 to all ranks.
-    This modifies ``param_state`` destructively.
+    This modifies ``param_state`` destructively, replacing the
+    ``_PosDimTensorInfo`` metadata with a ``_BroadcastHandle`` object, which
+    contains the work handle to wait on.
 
     Args:
         unsharded_tensor (Optional[torch.Tensor]): Unsharded tensor to
@@ -845,9 +873,11 @@ def _broadcast_unsharded_pos_dim_tensor_state(
         unsharded_tensor = torch.zeros(
             shape, requires_grad=False, dtype=dtype, device=broadcast_device,
         )
-    dist.broadcast(unsharded_tensor, src=0, group=group)
+    # Broadcast asynchronously and wait on the work handle later after all
+    # broadcasts have been scheduled
+    work = dist.broadcast(unsharded_tensor, src=0, group=group, async_op=True)
     # Keep the tensor on the broadcast device, which is typically GPU
-    param_state[state_name] = unsharded_tensor
+    param_state[state_name] = _BroadcastHandle(work, unsharded_tensor)
 
 
 def _get_flat_param_to_fsdp_module(model: torch.nn.Module):
