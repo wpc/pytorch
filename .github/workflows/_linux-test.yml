@@ -15,10 +15,10 @@ on:
         required: true
         type: string
         description: Docker image to run in.
-      needs-submodules:
+      checkout-pytorch-submodules:
         required: false
         default: false
-        type: boolean
+        type: string
         description: If this job needs to checkout the submodules
 
 env:
@@ -39,7 +39,7 @@ jobs:
       - name: Checkout PyTorch
         uses: pytorch/pytorch/.github/actions/checkout-pytorch@master
         with:
-          submodules: ${{ inputs.needs-submodules }}
+          submodules: ${{ inputs.checkout-pytorch-submodules }}
 
       - name: Setup Linux
         uses: ./.github/actions/setup-linux
