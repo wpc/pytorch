@@ -15,6 +15,11 @@ on:
         required: true
         type: string
         description: Docker image to run in.
+      needs-submodules:
+        required: false
+        default: false
+        type: boolean
+        description: If this job needs to checkout the submodules
 
 env:
   IN_CI: 1 # TODO delete in favor of GITHUB_ACTIONS
@@ -34,7 +39,7 @@ jobs:
       - name: Checkout PyTorch
         uses: pytorch/pytorch/.github/actions/checkout-pytorch@master
         with:
-          submodules: false
+          submodules: ${{ inputs.needs-submodules }}
 
       - name: Setup Linux
         uses: ./.github/actions/setup-linux
